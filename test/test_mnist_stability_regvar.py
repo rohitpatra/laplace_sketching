@@ -12,7 +12,7 @@ import gzip
 import os
 from utils import FlexibleMLP, generate_real_data_gradients, compute_estimated_variance_right_only, compute_estimated_variance
 from mnist_example_simple import train_binary_model, create_binary_mnist_dataloaders, evaluate_binary_model,plot_training_results
-from finetune_script import sketch_regvar_right, sketch_regvar_left, variance_estimate_regvar
+from finetune_script import sketch_regvar_right, sketch_regvar_left, variance_estimate_regvar, finetune_model_regvar, plot_finetune_losses
 from typing import Dict, List
 
 
@@ -20,15 +20,16 @@ from typing import Dict, List
 """
 
 positive_class={0, 2, 4, 6, 8}
-num_pretrain_epochs=100
-num_finetune_epochs=25
-lr=0.001
-right_sketch_size=50
+num_pretrain_epochs=6000
+num_finetune_epochs=1000
+lr=0.0001
+finetune_lr=0.0001
+right_sketch_size=2
 max_samples=1000
 f_lambda_in=[0.05, .2]
 save_results=True
-verbose=False
-
+verbose=True
+prior_scale=0.01
 base_path = "/shared/public/sharing/laplace-sketching"
 if not os.path.exists(os.path.join(base_path, "trained_models")):
     os.makedirs(os.path.join(base_path, "trained_models"))
@@ -42,8 +43,8 @@ print(f"Using device: {device}")
 # Define model architecture
 model_configs = [
     {
-        'name': '2_layer_32_32_mnist',
-        'hidden_dims': [32, 32],
+        'name': '2_layer_8_16_mnist',
+        'hidden_dims': [8, 16],
         'dropout_rate': 0.0,
         'batch_norm': False
     }
@@ -51,7 +52,7 @@ model_configs = [
 # Create binary MNIST dataloaders
 print("Setting up binary MNIST classification...")
 train_loader, test_loader = create_binary_mnist_dataloaders(
-    batch_size=128, 
+    batch_size=60000, 
     positive_class=positive_class
 )
 model = FlexibleMLP(input_dim=784, 
@@ -62,7 +63,8 @@ model = FlexibleMLP(input_dim=784,
 print(f"model size is {sum(p.numel() for p in model.parameters())}")
 
 # Create model checkpoint filename based on configuration
-model_filename = f"{base_path}/trained_models/{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}.pth"
+model_filename = f"{base_path}/trained_models/{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}_prior_scale_{prior_scale}.pth"
+
 
 # Check if model already exists
 if os.path.exists(model_filename):
@@ -77,12 +79,15 @@ if os.path.exists(model_filename):
     test_precisions = checkpoint.get('test_precisions', [])
     test_recalls = checkpoint.get('test_recalls', [])
     test_f1_scores = checkpoint.get('test_f1_scores', [])
-    
+    test_losses = checkpoint.get('test_losses', [])
+    train_l2 = checkpoint.get('train_l2', [])
+    batch_grad_norms = checkpoint.get('batch_grad_norms', [])
+    epoch_grad_norms = checkpoint.get('epoch_grad_norms', [])
     print(f"Model loaded successfully! Training was completed with {len(train_losses)} epochs.")
 else:
     print("Training new model...")
-    pretrained_model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores = train_binary_model(model, train_loader, test_loader, num_epochs=num_pretrain_epochs, lr=lr)
-    
+    pretrained_model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores, test_losses, train_l2, batch_grad_norms, epoch_grad_norms = train_binary_model(model, train_loader, test_loader, num_epochs=num_pretrain_epochs, lr=lr, track_grad_norm=True, best_model_path=f"best_model_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}.pt", prior_scale=prior_scale)
+    plot_training_losses(train_losses, test_losses, test_accuracies, epoch_grad_norms, filename=f"Training_summary_{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}_prior_scale_{prior_scale}.pdf")    
     # Save the trained model and metrics
     print(f"Saving model to {model_filename}...")
     checkpoint = {
@@ -92,16 +97,21 @@ else:
         'test_precisions': test_precisions,
         'test_recalls': test_recalls,
         'test_f1_scores': test_f1_scores,
+        'test_losses': test_losses,
+        'train_l2': train_l2,
+        'batch_grad_norms': batch_grad_norms,
+        'epoch_grad_norms': epoch_grad_norms,
         'model_config': model_configs[0],
         'training_params': {
             'num_epochs': num_pretrain_epochs,
             'lr': lr,
-            'positive_class': positive_class
+            'positive_class': positive_class,
+            'prior_scale': prior_scale
         }
     }
     torch.save(checkpoint, model_filename)
     print("Model saved successfully!")
-# Final evaluation of the best model
+    # Final evaluation of the best model
 
 final_metrics = evaluate_binary_model(pretrained_model, test_loader, device)
 print(f"\n Final Results for {model_configs[0]['name']}:")
@@ -109,18 +119,28 @@ print(f"   Accuracy: {final_metrics['accuracy']:.2f}%")
 print(f"   Precision: {final_metrics['precision']:.2f}%")
 print(f"   Recall: {final_metrics['recall']:.2f}%")
 print(f"   F1 Score: {final_metrics['f1']:.2f}%")
+print(f"   Test Loss: {final_metrics['loss']:.4f}")
 print(f"   Model parameters: {pretrained_model.get_num_parameters():,}")
 # Plot training results
+
+# find the best epoch
+best_epoch = np.argmin(test_losses)
+print(f"Best epoch: {best_epoch}")
+print(f"Best test loss: {test_losses[best_epoch]:.4f}")
+print(f"Best test accuracy: {test_accuracies[best_epoch]:.2f}%")
+print(f"Best test precision: {test_precisions[best_epoch]:.2f}%")
+print(f"Best test recall: {test_recalls[best_epoch]:.2f}%")
+print(f"Best test f1 score: {test_f1_scores[best_epoch]:.2f}%")
+print(f"Best epoch grad norm: {epoch_grad_norms[best_epoch]:.4f}")
+
 
 if not os.path.exists(os.path.join(base_path, "training_results")):
     os.makedirs(os.path.join(base_path, "training_results"))
 
 # Only plot if we have training metrics (i.e., model was trained, not loaded)
-if train_losses and test_accuracies:
-    plot_training_results(
-        train_losses, 
-        test_accuracies, 
-        filename=f"{base_path}/training_results/{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}_training_results.pdf"
+if train_losses and test_accuracies and test_losses and epoch_grad_norms:
+    plot_training_losses(train_losses, test_losses, test_accuracies, epoch_grad_norms, 
+        filename=f"{base_path}/training_results/{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}_prior_scale_{prior_scale}_training_results.pdf"
     )
 else:
     print("Skipping training plots - model was loaded from checkpoint.")
@@ -131,36 +151,60 @@ for name, param in pretrained_model.named_parameters():
 num_params = sum(p.numel() for p in pretrained_model.parameters())
 right_sketch_matrix = torch.randn(2, num_params, device=device) / np.sqrt(right_sketch_size)
 right_sketch_matrix = right_sketch_matrix.float()
+right_sketch_matrix.shape
 ## add a third row to right_sketch_matrix that is the sum of the first two rows
-# Create a new row as the sum of the first two rows, keeping it 2D
 sum_row = right_sketch_matrix[:2].sum(dim=0, keepdim=True)
 right_sketch_matrix = torch.cat([right_sketch_matrix, sum_row], dim=0)
-f_lambda_in = [0.05, .2]
+right_sketch_matrix.shape
+
+f_lambda_in = [0.05]
 hessian_inv_u_by_lambda: Dict[float, List[torch.Tensor]] = {f_lambda: [] for f_lambda in f_lambda_in}
 model_by_lambda: Dict[float, List[nn.Module]] = {f_lambda: [] for f_lambda in f_lambda_in}
-for sr in range(right_sketch_size):
-    print(f"Processing right sketch vector {sr+1}/{right_sketch_size}")
-    # Use the flattened sketch vector directly - no conversion needed!
-    u_eval_vector = right_sketch_matrix[sr, :]
-    hessian_inv_u, _, finetuned_model_dict = variance_estimate_regvar(
-        input_model=pretrained_model,
-        finetune_loader=train_loader,
-        u_eval=u_eval_vector, 
-        input_data=None,  # Set to none to use gaussian sketch
-        f_lambda_vec=f_lambda_in,
-        num_finetune_epochs=num_finetune_epochs,
-        device=device,
-        verbose=verbose,
-        method="u_based"
-    )
+# for sr in range(right_sketch_matrix.shape[0]):
+#     print(f"Processing right sketch vector {sr+1}/{right_sketch_size}")
+#     # Use the flattened sketch vector directly - no conversion needed!
+u_eval_vector = right_sketch_matrix[1, :]
+finetuned_model_dict = {}
+f_lambda = 5e-5
+# for f_lambda in f_lambda_in:
+if verbose:
+    for name, param in pretrained_model.named_parameters():
+        print(f"{name}: {param.data.norm(p=2, dim=0).mean():.6f} (BEFORE finetuning with lambda={f_lambda})")
+
+finetuned_model, losses, val_losses, penalty_values, loss_values = finetune_model_regvar(
+    input_model=pretrained_model,
+    u_eval_in=u_eval_vector,
+    data_in=None,
+    finetune_data_loader=train_loader,
+    finetune_lambda=f_lambda,
+    finetune_lr=finetune_lr,
+    num_epochs=num_finetune_epochs,
+    device=device,
+    verbose=verbose,
+    save_best_model=True,
+    val_loader=test_loader
+)
+
+if verbose:
+    for name, param in finetuned_model.named_parameters():
+        print(f"{name}: {param.data.norm(p=2, dim=0).mean():.6f} (AFTER finetuning with lambda={f_lambda})")
+finetuned_model_dict[f_lambda] = finetuned_model
+# variance estimates at input_data
+plot_four_losses(losses, val_losses, penalty_values, loss_values, filename=f"{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}_finetune_epochs_{num_finetune_epochs}_lr_{finetune_lr}_finetune_losses.pdf")
+
+
+hessian_inv_u = {}
+    for f_lambda, model in finetuned_model_dict.items():
+        flat_params_pretrained = torch.nn.utils.parameters_to_vector(pretrained_model.parameters()).detach().clone()
+        flat_params_finetuned = torch.nn.utils.parameters_to_vector(model.parameters()).detach().clone()
+        hessian_inv_u[f_lambda] = -(flat_params_finetuned - flat_params_pretrained) / f_lambda  ## TODO: What is the prior here? See James's paper
     for f_lambda, model in finetuned_model_dict.items():
         hessian_inv_u_by_lambda[f_lambda].append(hessian_inv_u[f_lambda])
         model_by_lambda[f_lambda].append(model)
         print(f"Finetuned model for f_lambda {f_lambda} has {sum(p.numel() for p in model.parameters())} parameters")
+
 hessian_inv_right_sketch = {f_lambda: torch.stack(hessian_inv_u_by_lambda[f_lambda], dim=1) for f_lambda in f_lambda_in}
 
-
-# H^-1 u_1 and H^-1 u_2 with H^-1 (u_1 + u_2)
 hessian_inv_u_1 = hessian_inv_right_sketch[f_lambda_in[0]][:, 0]
 hessian_inv_u_2 = hessian_inv_right_sketch[f_lambda_in[0]][:, 1]
 hessian_inv_u_sum = hessian_inv_right_sketch[f_lambda_in[0]][:, 2]
