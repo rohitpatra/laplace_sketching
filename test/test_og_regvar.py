@@ -20,8 +20,8 @@ from typing import Dict, List
 """
 
 positive_class={0, 2, 4, 6, 8}
-num_pretrain_epochs=10000
-num_finetune_epochs=70
+num_pretrain_epochs=7000
+num_finetune_epochs=100
 lr=0.0001
 finetune_lr=0.0001
 right_sketch_size=2
@@ -87,7 +87,17 @@ if os.path.exists(model_filename):
     print(f"Model loaded successfully! Training was completed with {len(train_losses)} epochs.")
 else:
     print("Training new model...")
-    pretrained_model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores, test_losses, train_l2, batch_grad_norms, epoch_grad_norms = train_binary_model(model, train_loader, test_loader, num_epochs=num_pretrain_epochs, lr=lr, track_grad_norm=True, best_model_path=f"best_model_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}.pt", prior_scale=prior_scale)
+    pretrained_model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores, test_losses, train_l2, batch_grad_norms, epoch_grad_norms = train_binary_model(
+        model,
+        train_loader,
+        test_loader,
+        num_epochs=num_pretrain_epochs,
+        lr=lr,
+        device=device,  # ensure training happens on the chosen device
+        track_grad_norm=True,
+        best_model_path=f"best_model_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}.pt",
+        prior_scale=prior_scale,
+    )
     plot_training_losses(train_losses, test_losses, test_accuracies, epoch_grad_norms, train_l2, filename=f"Training_summary_{model_configs[0]['name']}_positive_class_{positive_class}_epochs_{num_pretrain_epochs}_lr_{lr}_prior_scale_{prior_scale}_activation_{model_configs[0]['activation']}.pdf")   
     # Save the trained model and metrics
     print(f"Saving model to {model_filename}...")
@@ -150,18 +160,20 @@ finetuned_model, losses, val_losses, penalty_values, loss_main, val_loss_main, b
 )
 
 # look at the diff between the finetuned model and the pretrained model
-flat_params_pretrained = torch.nn.utils.parameters_to_vector(pretrained_model.parameters()).detach().clone()
-flat_params_finetuned = torch.nn.utils.parameters_to_vector(finetuned_model.parameters()).detach().clone()
+flat_params_pretrained = torch.nn.utils.parameters_to_vector(pretrained_model.parameters()).detach().clone().to(device)
+flat_params_finetuned = torch.nn.utils.parameters_to_vector(finetuned_model.parameters()).detach().clone().to(device)
 diff = flat_params_finetuned - flat_params_pretrained
 print(f"diff between finetuned and pretrained model when finetuned with lambda {f_lambda} for {num_finetune_epochs} epochs: {diff.norm()}")
+
+
 # diff between finetuned and pretrained model when finetuned with lambda 0.0001 for 1000 epochs: 0.9403998851776123
 
 num_finetune_epochs = 500
 finetuned_model_500, losses_500, val_losses_500, penalty_values_500, loss_main_500, val_loss_main_500, best_epoch_500 = finetune_model_regvar(pretrained_model, u_eval_in=None, data_in=first_x, finetune_data_loader=train_loader, finetune_lambda=f_lambda, finetune_lr=finetune_lr, num_epochs=num_finetune_epochs, device=device, verbose=True, save_best_model=False, save_path=f"best_finetune_model_lambda_{f_lambda}_e500.pt", val_loader=None)
 
 # look at the diff between the finetuned model and the pretrained model
-flat_params_pretrained = torch.nn.utils.parameters_to_vector(pretrained_model.parameters()).detach().clone()
-flat_params_finetuned = torch.nn.utils.parameters_to_vector(finetuned_model_500.parameters()).detach().clone()
+flat_params_pretrained = torch.nn.utils.parameters_to_vector(pretrained_model.parameters()).detach().clone().to(device)
+flat_params_finetuned = torch.nn.utils.parameters_to_vector(finetuned_model_500.parameters()).detach().clone().to(device)
 diff = flat_params_finetuned - flat_params_pretrained
 print(f"diff between finetuned and pretrained model when finetuned with lambda {f_lambda} for {num_finetune_epochs} epochs: {diff.norm()}")
 
@@ -173,8 +185,14 @@ print(flat_params_pretrained.norm(), flat_params_finetuned.norm())
 (finetuned_model(first_x) - pretrained_model(first_x))/ f_lambda 
 
 
-hessian_matrix_inv, flat_params, hessian_matrix, hessian_matrix_offset = compute_hessian_binary(pretrained_model, train_loader, device, diagonal_offset = 0.0)
-
+h_inv, flat_p, H, Hoff = compute_hessian_binary(
+    pretrained_model,
+    train_loader,
+    device,
+    diagonal_offset=0.0,
+    prior_scale=prior_scale,
+    profile=True,      # optional profiling
+)
 
 def grad_func_local(flat_params, new_inputs):
     param_dict = {}
@@ -190,6 +208,12 @@ new_gradient = torch.autograd.functional.jacobian(
     flat_params
 ).squeeze(1)
 oracle_var = torch.einsum('bi,ij,bj->b', new_gradient, hessian_inv, new_gradient)
+
+
+
+
+# appendix
+
 
 # ---- run the RegVar finetuning & variance estimation --------------------
 h_inv_u, regvar_est, finetuned = variance_estimate_regvar(
