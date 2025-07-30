@@ -13,6 +13,13 @@ import numpy as np
 import urllib.request
 import gzip
 import os
+import time  # ⏲️ Timing utility
+# Optional: richer memory stats if psutil is available
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from utils import FlexibleMLP
 
 def download_mnist():
@@ -392,7 +399,7 @@ def train_binary_model(model, train_loader, test_loader, num_epochs=10, lr=0.001
 
 
 
-def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1):
+def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1, prior_scale=0.0, *, vectorize=True, profile=False):
     """Compute the Hessian matrix of the loss with respect to model parameters for binary classification."""        
     # Create an uncompiled copy of the model for Hessian computation
     # torch.compile interferes with higher-order derivatives needed for Hessian
@@ -403,6 +410,8 @@ def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1
     else:
         # Model was not compiled
         hessian_model = model
+    # Ensure model is on the same device as inputs/parameters
+    hessian_model = hessian_model.to(device)
     # Collect all validation data
     eval_inputs = []
     eval_targets = []
@@ -412,8 +421,28 @@ def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1
     eval_inputs = torch.cat(eval_inputs, dim=0)
     eval_targets = torch.cat(eval_targets, dim=0)
     hessian_model.eval()
+    # ---------------- PROFILING HELPERS ----------------
+    def _mem_snapshot():
+        """Return human-readable memory usage for CPU and (if applicable) GPU."""
+        snap = []
+        # CPU RSS
+        if psutil is not None:
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+            snap.append(f"CPU {rss_mb:,.1f} MB")
+        # GPU
+        if torch.cuda.is_available():
+            mem_mb = torch.cuda.memory_allocated(device) / 1024 ** 2
+            max_mb = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+            snap.append(f"GPU {mem_mb:,.1f}/{max_mb:,.1f} MB (current/max)")
+        return ", ".join(snap)
+    def _log(stage, ts):
+        if profile:
+            print(f"[PROFILE] {stage:<30}  took {time.perf_counter() - ts:6.2f}s   |   {_mem_snapshot()}")
+        return time.perf_counter()
+    t0 = time.perf_counter()
     flat_params = torch.nn.utils.parameters_to_vector(hessian_model.parameters()).detach().clone()
     flat_params.requires_grad = True
+    t0 = _log("Param vectorisation", t0)
     def loss_func(flat_params):
         param_dict = {}
         pointer = 0
@@ -424,14 +453,29 @@ def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1
         outputs = torch.func.functional_call(hessian_model, param_dict, eval_inputs)
         # Squeeze outputs to match target shape for binary classification
         outputs = outputs.squeeze()
-        loss = nn.BCEWithLogitsLoss()(outputs, eval_targets)
+        loss = nn.BCEWithLogitsLoss(reduction='sum')(outputs, eval_targets) + eval_targets.size(0) * 0.5 * prior_scale * sum(p.pow(2).sum() for p in hessian_model.parameters())
+        loss = loss / eval_targets.size(0)
         return loss
-    print(f"Computing Hessian matrix... model and data loaded")
-    hessian_matrix = torch.autograd.functional.hessian(loss_func, flat_params)
+    print(f"Computing Hessian matrix (vectorize={vectorize}, profile={profile}) … model and data loaded")
+    # Use `vectorize=True` (functorch powered) for significant speed-ups when available.
+    # Fallback gracefully if running on an older PyTorch version.
+    try:
+        hessian_matrix = torch.autograd.functional.hessian(
+            loss_func,
+            flat_params,
+            vectorize=vectorize,
+        )
+    except TypeError:
+        # Older PyTorch; vectorised path not supported
+        print("Falling back to non-vectorized Hessian computation (PyTorch < 2.0). This will be slower.")
+        hessian_matrix = torch.autograd.functional.hessian(loss_func, flat_params)
+    t0 = _log("Hessian computation", t0)
     # Add diagonal offset for numerical stability
     identity = torch.eye(hessian_matrix.size(0), dtype=hessian_matrix.dtype, device=hessian_matrix.device)
     hessian_matrix_offset = hessian_matrix + diagonal_offset * identity
-    hessian_matrix_offset_inv = torch.inverse(hessian_matrix_offset)    
+    t0 = _log("Diagonal offset", t0)
+    hessian_matrix_offset_inv = torch.linalg.inv(hessian_matrix_offset)
+    t0 = _log("Matrix inversion", t0)
     return hessian_matrix_offset_inv, flat_params, hessian_matrix, hessian_matrix_offset
 
 
