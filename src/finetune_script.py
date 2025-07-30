@@ -10,7 +10,7 @@ import torch.optim as optim
 import numpy as np
 import copy
 from typing import Dict, List
-
+import matplotlib.pyplot as plt
 def create_finetune_data(num_samples=1000, input_dim=20, output_dim=1, noise_level=0.1):
     """Create new data for finetuning with different distribution."""
     # Different data distribution for finetuning
@@ -23,25 +23,24 @@ def create_finetune_data(num_samples=1000, input_dim=20, output_dim=1, noise_lev
     y_tensor = torch.from_numpy(y).float()
     
     return X_tensor, y_tensor
-## TODO: lets ensure we pick the best model here and look at the loss curves for some examples/models
-def finetune_model_regvar(input_model, u_eval_in, data_in, finetune_data_loader, orig_loss, finetune_lambda=1.0, lr=1e-4, num_epochs=20, device='cpu', verbose=False, save_best_model=False, save_path='best_finetune_model.pt', val_loader=None):
+
+def finetune_model_regvar(input_model, u_eval_in, data_in, finetune_data_loader, finetune_lambda=1.0, finetune_lr=1e-4, num_epochs=20, device='cpu', verbose=False, save_best_model=False, save_path='best_finetune_model.pt', val_loader=None, prior_scale=0.0):
     """
     Finetune a pretrained model with new loss and data at given u_eval_in OR data_in at lambda =  finetune_lambda.
-    
+    If prior_scale is not 0.0, then the loss will be  orig_loss + finetune_lambda * penalty + prior_scale * model(data_in).abs().sum()
     Args:
         input_model: Pre-trained model
         u_eval_in: Flattened vector of gradients for regvar penalty, if not none, penalty for finetuning will be finetune_lambda * theta^T u_eval_in. One of u_eval_in or data_in must be provided.
         data_in: if not none, penalty for finetuning will be finetune_lambda * model(data_in).  Only one of u_eval_in OR data_in must be provided.
         finetune_data_loader: DataLoader with finetuning the input_model.
-        orig_loss: Loss function to use for finetuning
         finetune_lambda : Regularization parameter for finetuning, Default is 1.0
-        lr: Learning rate for finetuning
+        finetune_lr: Learning rate for finetuning
         num_epochs: Number of finetuning epochs
         device: Device to run on
         save_best_model: Whether to save the best model based on lowest validation loss
         save_path: Path to save the best model
         val_loader: Validation data loader (required if save_best_model=True)
-    
+        prior_scale: Prior scale for finetuning, Default is 0.0
     Returns:
         model: Finetuned model
         losses: List of training losses per epoch
@@ -57,7 +56,12 @@ def finetune_model_regvar(input_model, u_eval_in, data_in, finetune_data_loader,
         print("Doing the finetuning with penalty of model(data_in)")
     elif verbose:
         print(f"Doing the finetuning with penalty of theta^T u_eval_in for finetune_lambda = {finetune_lambda}")
-
+    # ------------------------------------------------------------------
+    # Hard-code the main loss to match train_binary_model so that all
+    # downstream calculations use *sum* reduction and we perform our own
+    # per-sample averaging at the epoch level.
+    # ------------------------------------------------------------------
+    orig_loss = nn.BCEWithLogitsLoss(reduction='sum')
     # Move penalty-related tensors to the correct device once
     if data_in is not None:
         data_in = data_in.to(device)
@@ -74,50 +78,59 @@ def finetune_model_regvar(input_model, u_eval_in, data_in, finetune_data_loader,
     input_model_local = copy.deepcopy(input_model)
     model = input_model_local.to(device)
     model.train()
-    
     # Use lower learning rate for finetuning
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    
+    optimizer = optim.Adam(model.parameters(), lr=finetune_lr, weight_decay=1e-5)
     losses = []
     val_losses = []
+    penalty_values = []
+    loss_main = []
+    val_loss_main = []
     best_val_loss = float('inf')
-    
+    best_epoch = -1
     if verbose:
-        print(f"Finetuning for {num_epochs} epochs with lr={lr}")
-    # print(f"Using loss function: {orig_loss.__name__}")
-    
+        print(f"Finetuning for {num_epochs} epochs with lr={finetune_lr}")
     for epoch in range(num_epochs):
         # Training phase
         model.train()
         epoch_loss = 0.0
-        num_batches = 0
-        
+        epoch_penalty = 0.0
+        epoch_loss_main = 0.0
+        total_samples = 0  # count samples processed in this epoch
         for batch_x, batch_y in finetune_data_loader:
-            batch_x, batch_y = batch_x.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
-            
+            batch_x, batch_y = batch_x.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)   
             optimizer.zero_grad(set_to_none=True)
             outputs = model(batch_x).squeeze() # now matches the original training step
-            if data_in is not None:
-                penalty = model(data_in).sum()
-            else:
+            if data_in is not None: # using OG regvar penalty
+                penalty = batch_y.size(0) * finetune_lambda * model(data_in).abs().sum()
+            else: # using the linear penalty based on the gradients as u_eval_in
                 # Efficient dot-product without re-flattening
-                penalty = sum((param * u_slice).sum() for param, u_slice in zip(model.parameters(), u_eval_slices))
-            loss = orig_loss(outputs, batch_y) + finetune_lambda * penalty ## TODO: finetune_lambda is not scaling with batch size
+                penalty = batch_y.size(0) * finetune_lambda * sum((param * u_slice).abs().sum() for param, u_slice in zip(model.parameters(), u_eval_slices))
+            loss_main_value = orig_loss(outputs, batch_y)
+            if prior_scale != 0.0:
+                loss_main_value = loss_main_value + batch_y.size(0) * 0.5 * prior_scale * sum(p.pow(2).sum() for p in model.parameters())
+            loss = loss_main_value +  penalty  
             loss.backward()
             optimizer.step()
-            
+            # Aggregate running sums (all are *sums* over the current batch)
             epoch_loss += loss.item()
-            num_batches += 1
-        
-        avg_loss = epoch_loss / num_batches
+            epoch_penalty += penalty.item()
+            epoch_loss_main += loss_main_value.item()
+            total_samples += batch_y.size(0)
+        # ----- Per-sample averages (to mirror train_binary_model) -----
+        avg_loss = epoch_loss / total_samples
+        avg_penalty = epoch_penalty / total_samples
+        avg_loss_main = epoch_loss_main / total_samples
         losses.append(avg_loss)
-        
+        penalty_values.append(avg_penalty)
+        loss_main.append(avg_loss_main)
+        if epoch % int(num_epochs / 20) ==0:
+            print(f"epoch: {epoch}, loss main: {avg_loss_main}, penalty: {avg_penalty}, total: {avg_loss}, ratio: {avg_loss_main / avg_penalty}")
         # Validation phase (always compute if val_loader is provided)
         if val_loader is not None:
             model.eval()
-            val_loss = 0.0
-            val_batches = 0
-            
+            epoch_val_loss = 0.0
+            epoch_val_loss_main = 0.0
+            val_total_samples = 0   
             with torch.no_grad():
                 for batch_x, batch_y in val_loader:
                     batch_x, batch_y = batch_x.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
@@ -126,35 +139,97 @@ def finetune_model_regvar(input_model, u_eval_in, data_in, finetune_data_loader,
                         penalty = model(data_in).sum()
                     else:
                         penalty = sum((param * u_slice).sum() for param, u_slice in zip(model.parameters(), u_eval_slices))
-                    val_loss += (orig_loss(outputs, batch_y) + finetune_lambda * penalty).item()
-                    val_batches += 1
+                    val_loss_main_value = orig_loss(outputs, batch_y)
+                    epoch_val_loss += (val_loss_main_value + finetune_lambda * penalty).item()
+                    epoch_val_loss_main += val_loss_main_value.item()
+                    val_total_samples += batch_y.size(0)
             
-            avg_val_loss = val_loss / val_batches
+            avg_val_loss = epoch_val_loss / val_total_samples
+            avg_val_loss_main = epoch_val_loss_main / val_total_samples
             val_losses.append(avg_val_loss)
-            
+            val_loss_main.append(avg_val_loss_main)
             # Save best model based on lowest validation loss
             if save_best_model and avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
+                best_epoch = epoch
                 torch.save(model.state_dict(), save_path)
             
-            if verbose and epoch % 5 == 0:
-                print(f"Epoch {epoch:3d}: Train Loss = {avg_loss:.6f}, Val Loss = {avg_val_loss:.6f}")
-        elif verbose and epoch % 5 == 0:
+            if verbose and epoch % int(num_epochs / 20) == 0:
+                print(f"Epoch {epoch:3d}: Train Loss = {avg_loss:.6f}, Val Loss = {avg_val_loss:.6f}, val_penalty_ratio: {avg_val_loss_main / avg_val_loss:.4f}")
+        elif verbose and epoch % int(num_epochs / 20) == 0:
             print(f"Epoch {epoch:3d}: Loss = {avg_loss:.6f}")
-    
     # Load best model at the end if saving was enabled
     if save_best_model:
-        model.load_state_dict(torch.load(save_path))
-    
-    if verbose: 
+        model.load_state_dict(torch.load(save_path))  
+    if save_best_model:
+        print(f"Finetuning complete! Best model came from epoch {best_epoch}.")
+        print(f"  Best validation loss: {best_val_loss:.6f}")
+        # `losses[best_epoch]` is the training loss for the best model
+        print(f"  Corresponding train loss: {losses[best_epoch]:.6f}")
+    else:
         print(f"Finetuning complete! Final train loss: {losses[-1]:.6f}")
         if val_losses:
-            print(f"Final validation loss: {val_losses[-1]:.6f}")
+            print(f"Final validation loss: {val_losses[-1]:.6f}") 
+    return model, losses, val_losses, penalty_values, loss_main, val_loss_main, best_epoch
+
+
+def plot_finetune_losses(train_losses, val_losses, penalty_values, loss_main, val_loss_main, filename=None):
+    """Plot finetune losses."""
+    try:
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        ax1, ax2, ax3 = axes[0]
+        ax4, ax5, ax6 = axes[1]
     
-    return model, losses, val_losses
+        # Plot training loss
+        ax1.plot(train_losses)
+        ax1.set_title('Training Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.grid(True)
+        # Plot validation loss
+        ax2.plot(val_losses)   
+        ax2.set_title('Validation Loss')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss')
+        ax2.grid(True)
+        # Plot penalty values  
+        ax3.plot(penalty_values)
+        ax3.set_title('Penalty value')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('value')
+        ax3.grid(True)
+        # Plot main loss
+        ax4.plot(loss_main)
+        ax4.set_title('Loss main')
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('value')
+        ax4.grid(True)
+        # Plot validation main loss
+        ax5.plot(val_loss_main)
+        ax5.set_title('Validation Loss main')
+        ax5.set_xlabel('Epoch')
+        ax5.set_ylabel('value')
+        ax5.grid(True)
+        # Plot ratio - check if val_losses has values
+        if val_loss_main and val_losses and len(val_loss_main) == len(val_losses):
+            ratio = [vm / vl if vl != 0 else 0 for vm, vl in zip(val_loss_main, val_losses)]
+            ax6.plot(ratio)
+        ax6.set_title('Validation Loss main / Validation Loss')
+        ax6.set_xlabel('Epoch')
+        ax6.set_ylabel('Ratio')
+        ax6.grid(True)
+        plt.tight_layout()
+        if filename is not None:
+            plt.savefig(filename)
+            plt.close()  # Close the figure to free memory
+        else:
+            plt.show()
+    except Exception as e:
+        print(f"Plotting failed: {e}")
+        print("Skipping plots...")
 
 
-def variance_estimate_regvar(input_model, finetune_loader, u_eval, input_data, f_lambda_vec=None, num_finetune_epochs=25, device="cpu", verbose=False, method="u_based"):
+def variance_estimate_regvar(input_model, finetune_loader, u_eval, input_data, f_lambda_vec=None, num_finetune_epochs=25, device="cpu", verbose=False, method="u_based", finetune_lr=1e-4):
     """ Estimate Regvar variance given input_data or u_eval
     """
     if method not in ["u_based", "data_based"]:
@@ -197,14 +272,13 @@ def variance_estimate_regvar(input_model, finetune_loader, u_eval, input_data, f
         if verbose:
             for name, param in input_model.named_parameters():
                 print(f"{name}: {param.data.norm(p=2, dim=0).mean():.6f} (BEFORE finetuning with lambda={f_lambda})")
-        finetuned_model, _ , _= finetune_model_regvar(
+        finetuned_model, _, _ = finetune_model_regvar(
             input_model=input_model,
             u_eval_in=u_eval,
             data_in=data_for_func,
             finetune_data_loader=finetune_loader,
-            orig_loss=nn.BCEWithLogitsLoss(),
             finetune_lambda=f_lambda,
-            lr=1e-4,
+            finetune_lr=finetune_lr,
             num_epochs=num_finetune_epochs,
             device=device,
             verbose=verbose
@@ -225,7 +299,7 @@ def variance_estimate_regvar(input_model, finetune_loader, u_eval, input_data, f
     return hessian_inv_u, regvar_u_est, finetuned_model_dict
 
 
-def sketch_regvar_right(input_model, finetune_loader, right_sketch_size, f_lambda_vec=None, num_finetune_epochs=25, device="cpu", verbose=False):
+def sketch_regvar_right(input_model, finetune_loader, right_sketch_size, f_lambda_vec=None, num_finetune_epochs=25, device="cpu", verbose=False, finetune_lr=1e-4):
     """
     Create sketch of the hessian with regvar as the oracle.
     Args:
@@ -271,7 +345,8 @@ def sketch_regvar_right(input_model, finetune_loader, right_sketch_size, f_lambd
             num_finetune_epochs=num_finetune_epochs,
             device=device,
             verbose=verbose,
-            method="u_based"
+            method="u_based",
+            finetune_lr=finetune_lr
         )
         for f_lambda, model in finetuned_model_dict.items():
             hessian_inv_u_by_lambda[f_lambda].append(hessian_inv_u[f_lambda])

@@ -19,11 +19,12 @@ def mnist_regvar_sketching(
         positive_class={0, 2, 4, 6, 8},
         num_pretrain_epochs=100,
         num_finetune_epochs=10,
-        lr=0.001,
+        lr=0.0001,
         right_sketch_size=50,
         max_samples=1000,
         f_lambda_in=[0.05, .2],
         save_results=True,
+        finetune_lr=0.001,
         verbose=False
 ):
     """
@@ -77,11 +78,13 @@ def mnist_regvar_sketching(
         test_precisions = checkpoint.get('test_precisions', [])
         test_recalls = checkpoint.get('test_recalls', [])
         test_f1_scores = checkpoint.get('test_f1_scores', [])
+        test_losses = checkpoint.get('test_losses', [])
+        train_l2 = checkpoint.get('train_l2', [])
         
         print(f"Model loaded successfully! Training was completed with {len(train_losses)} epochs.")
     else:
         print("Training new model...")
-        pretrained_model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores = train_binary_model(model, train_loader, test_loader, num_epochs=num_pretrain_epochs, lr=lr)
+        pretrained_model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores, test_losses, train_l2 = train_binary_model(model, train_loader, test_loader, num_epochs=num_pretrain_epochs, lr=lr)
         
         # Save the trained model and metrics
         print(f"Saving model to {model_filename}...")
@@ -92,6 +95,8 @@ def mnist_regvar_sketching(
             'test_precisions': test_precisions,
             'test_recalls': test_recalls,
             'test_f1_scores': test_f1_scores,
+            'test_losses': test_losses,
+            'train_l2': train_l2,
             'model_config': model_configs[0],
             'training_params': {
                 'num_epochs': num_pretrain_epochs,
@@ -134,7 +139,8 @@ def mnist_regvar_sketching(
         f_lambda_vec=f_lambda_in,
         num_finetune_epochs=num_finetune_epochs,
         device=device,
-        verbose=verbose
+        verbose=verbose,
+        finetune_lr=finetune_lr
     )
 
     # # Compute Hessian of the best model on the training set
@@ -160,7 +166,8 @@ def mnist_regvar_sketching(
             num_finetune_epochs=num_finetune_epochs,
             device=device,
             verbose=verbose,
-            method="u_based"
+            method="u_based",
+            finetune_lr=finetune_lr
         )
         # Populate oracle_vars dictionary with the variance estimates for each lambda
         for f_lambda in f_lambda_in:
@@ -278,7 +285,8 @@ def main():
         max_samples=200,
         save_results=True,
         verbose=False,
-        f_lambda_in=[0.05, .2]
+        f_lambda_in=[0.05, .2],
+        finetune_lr=0.0001
     )
 
 

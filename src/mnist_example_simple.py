@@ -235,7 +235,7 @@ def create_binary_mnist_dataloaders(batch_size=128, normalize=True, positive_cla
 def train_model(model, train_loader, test_loader, num_epochs=10, lr=0.001, device='cpu'):
     """Train the FlexibleMLP model on MNIST (multi-class)."""
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(reduction='sum')  # Use sum instead of mean
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     train_losses = []
@@ -249,6 +249,7 @@ def train_model(model, train_loader, test_loader, num_epochs=10, lr=0.001, devic
         # Training phase
         model.train()
         running_loss = 0.0
+        total_samples = 0
         
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
@@ -260,12 +261,13 @@ def train_model(model, train_loader, test_loader, num_epochs=10, lr=0.001, devic
             optimizer.step()
             
             running_loss += loss.item()
+            total_samples += target.size(0)  # Count actual samples
             
             if batch_idx % 200 == 0:
                 print(f'Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, '
-                      f'Loss: {loss.item():.6f}')
+                      f'Loss: {loss.item()/target.size(0):.6f}')  # Show per-sample loss
         
-        avg_train_loss = running_loss / len(train_loader)
+        avg_train_loss = running_loss / total_samples  # Correct averaging
         train_losses.append(avg_train_loss)
         
         # Testing phase
@@ -277,18 +279,25 @@ def train_model(model, train_loader, test_loader, num_epochs=10, lr=0.001, devic
     
     return train_losses, test_accuracies
 
-def train_binary_model(model, train_loader, test_loader, num_epochs=10, lr=0.001, device='cpu', best_model_path='best_local_model.pt'):
+def train_binary_model(model, train_loader, test_loader, num_epochs=10, lr=0.001, device='cpu', track_grad_norm=False, best_model_path='best_local_model.pt', prior_scale=0.0):
     """Train the FlexibleMLP model for binary classification."""
     model = model.to(device)
-    criterion = nn.BCEWithLogitsLoss()  # Binary cross-entropy loss
+    criterion = nn.BCEWithLogitsLoss(reduction='sum')  # Use sum instead of mean
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     train_losses = []
     test_accuracies = []
     test_precisions = []
     test_recalls = []
+    test_losses = []
     test_f1_scores = []
+    best_epoch = -1
+    train_l2 = [] if prior_scale > 0 else None
     
+    # Gradient-norm history (only populated if tracking is enabled)
+    batch_grad_norms = [] if track_grad_norm else None
+    epoch_grad_norms = [] if track_grad_norm else None
+
     # Track best model
     best_accuracy = 0.0
     
@@ -300,54 +309,91 @@ def train_binary_model(model, train_loader, test_loader, num_epochs=10, lr=0.001
         # Training phase
         model.train()
         running_loss = 0.0
+        total_samples = 0
+        running_l2 = 0.0
         
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
             
             optimizer.zero_grad(set_to_none=True)
             output = model(data).squeeze()  # Remove extra dimension for binary classification
-            loss = criterion(output, target)
+            loss = criterion(output, target) 
+            if prior_scale > 0:
+                l2 = target.size(0) * 0.5 * prior_scale * sum(p.pow(2).sum() for p in model.parameters())
+                loss = loss + l2
             loss.backward()
+
+            # ---------- GRADIENT-NORM TRACKING ----------
+            if track_grad_norm:
+                total_norm_sq = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        total_norm_sq += p.grad.detach().pow(2).sum()
+                grad_norm = total_norm_sq.sqrt().item()  # global L2 norm
+                batch_grad_norms.append(grad_norm)
+            # -------------------------------------------
+
             optimizer.step()
             
             running_loss += loss.item()
-            
-            if batch_idx % 200 == 0:
-                print(f'Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, '
-                      f'Loss: {loss.item():.6f}')
+            total_samples += target.size(0)  # Count actual samples
+            if prior_scale > 0:
+                running_l2 += l2.item()
+        # end of epoch
+        if track_grad_norm:
+            epoch_grad_norms.append(np.mean(batch_grad_norms[-len(train_loader):]))
         
-        avg_train_loss = running_loss / len(train_loader)
+        avg_train_loss = running_loss / total_samples  # Correct averaging
         train_losses.append(avg_train_loss)
-        
+        if prior_scale > 0:
+            train_l2.append(running_l2 / total_samples)
         # Testing phase
         metrics = evaluate_binary_model(model, test_loader, device)
         test_accuracies.append(metrics['accuracy'])
         test_precisions.append(metrics['precision'])
         test_recalls.append(metrics['recall'])
         test_f1_scores.append(metrics['f1'])
-        
-        print(f'Epoch {epoch+1}/{num_epochs}: Train Loss = {avg_train_loss:.4f}, '
-              f'Test Acc = {metrics["accuracy"]:.2f}%, '
-              f'Precision = {metrics["precision"]:.2f}%, '
-              f'Recall = {metrics["recall"]:.2f}%, '
-              f'F1 = {metrics["f1"]:.2f}%')
-        
+        test_losses.append(metrics['loss'])
+        if epoch % int(num_epochs/50) == 0: 
+            print(f'Epoch {epoch+1}/{num_epochs}: Train Loss = {avg_train_loss:.4f}, '
+                f'Test Acc = {metrics["accuracy"]:.2f}%, '
+                f'Test Loss = {metrics["loss"]:.4f}')
+            if track_grad_norm:
+                print(f'Epoch {epoch+1}/{num_epochs}: Batch Grad Norm = {np.mean(batch_grad_norms[-len(train_loader):]):.4f}, '
+                    f'Epoch Grad Norm = {(epoch_grad_norms[-1]):.4f}')
+            
         # Save best model based on accuracy
         if metrics['accuracy'] > best_accuracy:
             best_accuracy = metrics['accuracy']
+            best_epoch = epoch
             torch.save(model.state_dict(), best_model_path)
     
     # Load best model at the end (only if accuracy improved)
     if best_accuracy > 0.0 and os.path.exists(best_model_path):
         model.load_state_dict(torch.load(best_model_path))
     
-    return model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores
+    # Return values depend on whether gradient tracking is enabled to preserve
+    # backward compatibility with existing callers that expect six outputs.
+    print(f" Training complete! Best model came from epoch {best_epoch}.")
+    print(f"  Best test accuracy: {best_accuracy:.6f} or {test_accuracies[best_epoch]:.6f}")
+    print(f"  Corresponding train loss: {train_losses[best_epoch]:.6f}")
+    print(f"  Best test loss: {test_losses[best_epoch]:.6f}")
+    print(f"  Best test precision: {test_precisions[best_epoch]:.6f}")
+    print(f"  Best test recall: {test_recalls[best_epoch]:.6f}")
+    print(f"  Best test f1: {test_f1_scores[best_epoch]:.6f}")
+    if prior_scale > 0:
+        print(f"  Best train l2: {train_l2[best_epoch]:.6f}")
+    if track_grad_norm:
+        return (model, train_losses, test_accuracies, test_precisions,
+                test_recalls, test_f1_scores, test_losses, train_l2, batch_grad_norms, epoch_grad_norms)
+    else:
+        return (model, train_losses, test_accuracies, test_precisions,
+                test_recalls, test_f1_scores, test_losses, train_l2)
+
 
 
 def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1):
-    """Compute the Hessian matrix of the loss with respect to model parameters for binary classification."""
-    print("Computing Hessian matrix...")
-        
+    """Compute the Hessian matrix of the loss with respect to model parameters for binary classification."""        
     # Create an uncompiled copy of the model for Hessian computation
     # torch.compile interferes with higher-order derivatives needed for Hessian
     if hasattr(model, '_orig_mod'):
@@ -380,6 +426,7 @@ def compute_hessian_binary(model, test_loader, device='cpu', diagonal_offset=0.1
         outputs = outputs.squeeze()
         loss = nn.BCEWithLogitsLoss()(outputs, eval_targets)
         return loss
+    print(f"Computing Hessian matrix... model and data loaded")
     hessian_matrix = torch.autograd.functional.hessian(loss_func, flat_params)
     # Add diagonal offset for numerical stability
     identity = torch.eye(hessian_matrix.size(0), dtype=hessian_matrix.dtype, device=hessian_matrix.device)
@@ -415,14 +462,19 @@ def evaluate_binary_model(model, test_loader, device='cpu'):
     # Ensure model is on the correct device
     model = model.to(device)
     model.eval()
+    criterion = nn.BCEWithLogitsLoss(reduction='sum')  # Use sum instead of mean
     
     all_predictions = []
     all_targets = []
+    running_loss = 0.0
+    total_samples = 0
     
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             outputs = model(data).squeeze()
+            running_loss += criterion(outputs, target).item()  # Sum of losses
+            total_samples += target.size(0)  # Count actual samples
             
             # Convert logits to probabilities and then to predictions
             probabilities = torch.sigmoid(outputs)
@@ -431,6 +483,9 @@ def evaluate_binary_model(model, test_loader, device='cpu'):
             all_predictions.extend(predictions.cpu().numpy())
             all_targets.extend(target.cpu().numpy())
     
+    # Correct average: total loss divided by total samples
+    avg_loss = running_loss / total_samples
+
     # Convert to numpy arrays
     all_predictions = np.array(all_predictions)
     all_targets = np.array(all_targets)
@@ -445,12 +500,15 @@ def evaluate_binary_model(model, test_loader, device='cpu'):
     precision = true_positives / (true_positives + false_positives) * 100 if (true_positives + false_positives) > 0 else 0
     recall = true_positives / (true_positives + false_negatives) * 100 if (true_positives + false_negatives) > 0 else 0
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+    # Average loss over the entire test set
     
     return {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1': f1,
+        'loss': avg_loss,
         'true_positives': true_positives,
         'false_positives': false_positives,
         'false_negatives': false_negatives,
@@ -525,6 +583,56 @@ def plot_binary_training_results(train_losses, test_accuracies, test_precisions,
     except Exception as e:
         print(f"Plotting failed: {e}")
         print("Skipping plots...")
+
+def plot_training_losses(train_losses, test_losses, test_accuracies, epoch_grad_norms, train_l2=None,filename=None):
+    """Plot three losses."""
+    try:
+        if train_l2 is not None:
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            ax1, ax2, ax3 = axes[0]
+            ax4, ax5, ax6 = axes[1]
+        else:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            ax1, ax2 = axes[0]
+            ax3, ax4 = axes[1]   
+        # Plot training loss
+        ax1.plot(train_losses)
+        ax1.set_title('Training Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.grid(True)
+        # Plot test accuracy
+        ax2.plot(test_losses)   
+        ax2.set_title('Validation Loss')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss')
+        ax2.grid(True)
+        # Plot validation loss  
+        ax3.plot(test_accuracies)
+        ax3.set_title('Test Accuracy')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Accuracy (%)')
+        ax3.grid(True)
+        ax4.plot(epoch_grad_norms)
+        ax4.set_title('Epoch Grad Norm')
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('Grad Norm')
+        ax4.grid(True)
+        if train_l2 is not None:
+            ax5.plot(train_l2)
+            ax5.set_title('Train L2')
+            ax5.set_xlabel('Epoch')
+            ax5.set_ylabel('L2')
+            ax5.grid(True)
+        plt.tight_layout()
+        if filename is not None:
+            plt.savefig(filename)
+        else:
+            plt.show()
+    except Exception as e:
+        print(f"Plotting failed: {e}")
+        print("Skipping plots...")
+
 
 def run_multiclass_classification():
     """Run multi-class MNIST classification."""
@@ -729,9 +837,9 @@ def run_binary_classification():
         )
         
         # Train model
-        model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores = train_binary_model(
+        model, train_losses, test_accuracies, test_precisions, test_recalls, test_f1_scores, test_losses, train_l2, batch_grad_norms, epoch_grad_norms = train_binary_model(
             model, train_loader, test_loader, 
-            num_epochs=10, lr=0.001, device=device
+            num_epochs=10, lr=0.001, device=device, track_grad_norm=True
         )
         
         # Final evaluation
@@ -744,7 +852,11 @@ def run_binary_classification():
             'num_params': model.get_num_parameters(),
             'precisions': test_precisions,
             'recalls': test_recalls,
-            'f1_scores': test_f1_scores
+            'test_losses': test_losses,
+            'train_l2': train_l2,
+            'f1_scores': test_f1_scores,
+            'batch_grad_norms': batch_grad_norms,
+            'epoch_grad_norms': epoch_grad_norms
         }
         
         print(f"\n📊 Final Results:")
@@ -787,6 +899,14 @@ def run_binary_classification():
             first_result['recalls'],
             first_result['f1_scores']
         )
+
+        # Plot gradient norms
+        plt.plot(first_result['epoch_grad_norms'])
+        plt.title("Average Gradient L2-Norm per Epoch")
+        plt.xlabel("Epoch")
+        plt.ylabel("‖∇θ‖₂")
+        plt.show()
+
 
 def main():
     """Main function with menu for classification type."""
